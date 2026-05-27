@@ -1063,3 +1063,351 @@ def load_feed_posts(include_seeds=True):
 
     posts = sorted(posts, key=lambda p: p.get("relevance", 0), reverse=True)
     return posts
+
+# ============================================================
+# Supabase public beta storage override
+# Appended override layer: posts, images, likes, reactions, comments
+# ============================================================
+
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
+
+
+SUPABASE_URL = get_secret_or_env("SUPABASE_URL", "")
+SUPABASE_KEY = get_secret_or_env("SUPABASE_KEY", "")
+SUPABASE_BUCKET = get_secret_or_env("SUPABASE_BUCKET", "cartflex-uploads")
+
+supabase_client = None
+if create_client and SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        supabase_client = None
+
+
+def supabase_enabled():
+    return supabase_client is not None
+
+
+def save_uploaded_image_local(uploaded_file, post_id, label):
+    if uploaded_file is None:
+        return ""
+
+    reset_uploaded_file(uploaded_file)
+
+    post_dir = UPLOADS_DIR / post_id
+    post_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", label).strip("_").lower()
+    filename = f"{safe_label}.jpg"
+    path = post_dir / filename
+
+    image = Image.open(uploaded_file).convert("RGB")
+    image.thumbnail((1200, 1200))
+    image.save(path, format="JPEG", quality=82)
+
+    return str(path)
+
+
+def save_uploaded_image(uploaded_file, post_id, label):
+    """
+    Supabase-first image upload.
+    Falls back to local data/uploads if Supabase is not configured.
+    Returns a public URL when Supabase works.
+    """
+    if uploaded_file is None:
+        return ""
+
+    reset_uploaded_file(uploaded_file)
+
+    image = Image.open(uploaded_file).convert("RGB")
+    image.thumbnail((1200, 1200))
+
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=82)
+    image_bytes = buffer.getvalue()
+
+    safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", label).strip("_").lower()
+    filename = f"{post_id}/{safe_label}_{uuid.uuid4().hex[:8]}.jpg"
+
+    if supabase_enabled():
+        try:
+            supabase_client.storage.from_(SUPABASE_BUCKET).upload(
+                filename,
+                image_bytes,
+                file_options={
+                    "content-type": "image/jpeg",
+                    "upsert": "true",
+                },
+            )
+            return supabase_client.storage.from_(SUPABASE_BUCKET).get_public_url(filename)
+        except Exception as e:
+            try:
+                st.warning(f"Supabase image upload failed, using local fallback: {e}")
+            except Exception:
+                pass
+
+    return save_uploaded_image_local(uploaded_file, post_id, label)
+
+
+def display_saved_image(path, caption=None):
+    try:
+        if path and str(path).startswith("http"):
+            st.image(path, caption=caption, use_container_width=True)
+            return True
+
+        if path and Path(path).exists():
+            st.image(path, caption=caption, use_container_width=True)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def save_post_record_local(record):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    post_id = record.get("post_id") or new_post_id()
+    filename = HAULS_DIR / f"cartflex_{timestamp}_{post_id}.json"
+
+    record["post_id"] = post_id
+    record["saved_at"] = record.get("saved_at") or now_iso()
+    record["app"] = APP_NAME
+
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+    return filename
+
+
+def save_post_record(record):
+    """
+    Supabase-first post saving.
+    Falls back to local JSON if Supabase is not configured.
+    """
+    post_id = record.get("post_id") or new_post_id()
+    record["post_id"] = post_id
+    record["saved_at"] = record.get("saved_at") or now_iso()
+    record["app"] = APP_NAME
+
+    if supabase_enabled():
+        try:
+            row = {
+                "post_id": post_id,
+                "display_name": record.get("display_name", "Anonymous"),
+                "category": normalize_category(record.get("category", "Top Cart")),
+                "metadata": record.get("metadata", {}) or {},
+                "analysis": record.get("analysis", {}) or {},
+                "image_paths": record.get("image_paths", {}) or {},
+                "actual_total": safe_float(record.get("actual_total", 0)),
+                "rank": record.get("rank", "") or "",
+                "difference": safe_float(record.get("difference", 0)),
+            }
+
+            supabase_client.table("posts").upsert(row, on_conflict="post_id").execute()
+
+            engagement = load_engagement(post_id)
+            save_engagement(post_id, engagement)
+
+            return f"supabase://posts/{post_id}"
+        except Exception as e:
+            try:
+                st.warning(f"Supabase post save failed, using local fallback: {e}")
+            except Exception:
+                pass
+
+    return save_post_record_local(record)
+
+
+def load_saved_records_local():
+    files = sorted(HAULS_DIR.glob("cartflex_*.json"), reverse=True)
+    records = []
+
+    for file in files:
+        try:
+            with open(file, "r", encoding="utf-8") as f:
+                record = json.load(f)
+            record["_file"] = str(file)
+            records.append(record)
+        except Exception:
+            pass
+
+    return records
+
+
+def load_saved_records():
+    """
+    Supabase-first record loading.
+    Falls back to local JSON if Supabase is not configured.
+    """
+    if supabase_enabled():
+        try:
+            response = (
+                supabase_client.table("posts")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(100)
+                .execute()
+            )
+
+            records = []
+            for row in response.data or []:
+                record = {
+                    "id": row.get("id", ""),
+                    "post_id": row.get("post_id", ""),
+                    "saved_at": row.get("created_at", ""),
+                    "app": APP_NAME,
+                    "display_name": row.get("display_name", "Anonymous"),
+                    "category": normalize_category(row.get("category", "Top Cart")),
+                    "metadata": row.get("metadata", {}) or {},
+                    "analysis": row.get("analysis", {}) or {},
+                    "image_paths": row.get("image_paths", {}) or {},
+                    "actual_total": safe_float(row.get("actual_total", 0)),
+                    "rank": row.get("rank", "") or "",
+                    "difference": safe_float(row.get("difference", 0)),
+                    "_file": "supabase",
+                }
+                records.append(record)
+
+            return records
+        except Exception as e:
+            try:
+                st.warning(f"Supabase load failed, using local fallback: {e}")
+            except Exception:
+                pass
+
+    return load_saved_records_local()
+
+
+def load_engagement(post_id):
+    default = default_engagement()
+
+    if not post_id:
+        return default
+
+    if supabase_enabled():
+        try:
+            response = (
+                supabase_client.table("engagement")
+                .select("*")
+                .eq("post_id", post_id)
+                .limit(1)
+                .execute()
+            )
+
+            if not response.data:
+                return default
+
+            row = response.data[0]
+            data = {
+                "likes": safe_int(row.get("likes", 0)),
+                "reactions": row.get("reactions", {}) or {},
+                "comments": row.get("comments", []) or [],
+            }
+
+            if not isinstance(data["reactions"], dict):
+                data["reactions"] = {}
+            if not isinstance(data["comments"], list):
+                data["comments"] = []
+
+            for key, value in default["reactions"].items():
+                if key not in data["reactions"]:
+                    data["reactions"][key] = value
+
+            return data
+        except Exception:
+            return default
+
+    path = engagement_file_for_post(post_id)
+
+    if not path.exists():
+        return default
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "likes" not in data:
+            data["likes"] = 0
+
+        if "reactions" not in data or not isinstance(data["reactions"], dict):
+            data["reactions"] = default["reactions"]
+
+        if "comments" not in data or not isinstance(data["comments"], list):
+            data["comments"] = []
+
+        for key in default["reactions"]:
+            if key not in data["reactions"]:
+                data["reactions"][key] = 0
+
+        return data
+    except Exception:
+        return default
+
+
+def save_engagement(post_id, engagement):
+    if not post_id:
+        return None
+
+    if supabase_enabled():
+        try:
+            row = {
+                "post_id": post_id,
+                "likes": safe_int(engagement.get("likes", 0)),
+                "reactions": engagement.get("reactions", {}) or {},
+                "comments": engagement.get("comments", []) or [],
+                "updated_at": now_iso(),
+            }
+
+            supabase_client.table("engagement").upsert(row, on_conflict="post_id").execute()
+            return f"supabase://engagement/{post_id}"
+        except Exception as e:
+            try:
+                st.warning(f"Supabase engagement save failed: {e}")
+            except Exception:
+                pass
+
+    path = engagement_file_for_post(post_id)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(engagement, f, indent=2, ensure_ascii=False)
+
+    return path
+
+
+def add_like(post_id):
+    engagement = load_engagement(post_id)
+    engagement["likes"] = safe_int(engagement.get("likes"), 0) + 1
+    save_engagement(post_id, engagement)
+
+
+def add_reaction(post_id, reaction):
+    engagement = load_engagement(post_id)
+
+    if reaction not in engagement["reactions"]:
+        engagement["reactions"][reaction] = 0
+
+    engagement["reactions"][reaction] = safe_int(engagement["reactions"].get(reaction, 0)) + 1
+    save_engagement(post_id, engagement)
+
+
+def add_comment(post_id, name, text):
+    engagement = load_engagement(post_id)
+
+    clean_name = (name or "Anonymous").strip() or "Anonymous"
+    clean_text = (text or "").strip()
+
+    if not clean_text:
+        return
+
+    engagement["comments"].append(
+        {
+            "name": clean_name[:40],
+            "text": clean_text[:1000],
+            "created_at": now_iso(),
+        }
+    )
+
+    save_engagement(post_id, engagement)
